@@ -87,7 +87,7 @@ cp /mnt/user/appdata/Energy_Projects/tables.json \
 
 3. Add a new container in Unraid Docker pointing to the same image:
 ```
-ghcr.io/arcreactorkc/energy_projects_syncer:latest
+ghcr.io/arcreactorkc/SQL_DB_SYNC:latest
 ```
 
 With volumes:
