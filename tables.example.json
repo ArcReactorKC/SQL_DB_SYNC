@@ -1,0 +1,65 @@
+[
+  {
+    "mssql_table": "admdecaturmindata",
+    "pg_schema": "dbo",
+    "pg_table": "admdecaturmindata",
+    "watermark_col": "t_stamp",
+    "watermark_type": "datetime",
+    "pk_cols": ["admdecaturmindata_ndx"],
+    "columns": ["admdecaturmindata_ndx", "power_kw", "energy_kwh", "device_number", "t_stamp"]
+  },
+  {
+    "mssql_table": "graincosolarmindata",
+    "pg_schema": "dbo",
+    "pg_table": "graincosolarmindata",
+    "watermark_col": "t_stamp",
+    "watermark_type": "datetime",
+    "pk_cols": ["graincosolarmindata_ndx"],
+    "columns": ["graincosolarmindata_ndx", "device_number", "energy_kwh", "power_kw", "t_stamp"]
+  },
+  {
+    "mssql_table": "greeleysolardata",
+    "pg_schema": "dbo",
+    "pg_table": "greeleysolardata",
+    "watermark_col": "t_stamp",
+    "watermark_type": "datetime",
+    "pk_cols": ["greeleysolardata_ndx"],
+    "columns": ["greeleysolardata_ndx", "device_number", "power_kw", "t_stamp"]
+  },
+  {
+    "mssql_table": "ifsiharvardmindata",
+    "pg_schema": "dbo",
+    "pg_table": "ifsiharvardmindata",
+    "watermark_col": "t_stamp",
+    "watermark_type": "datetime",
+    "pk_cols": ["ifsiharvardmindata_ndx"],
+    "columns": ["ifsiharvardmindata_ndx", "t_stamp", "energy_kwh", "device_number", "power_kw"]
+  },
+  {
+    "mssql_table": "rushcreekmindata",
+    "pg_schema": "dbo",
+    "pg_table": "rushcreekmindata",
+    "watermark_col": "t_stamp",
+    "watermark_type": "datetime",
+    "pk_cols": ["rushcreekmindata_ndx"],
+    "columns": ["rushcreekmindata_ndx", "power_kw", "energy_kwh", "device_number", "t_stamp"]
+  },
+  {
+    "mssql_table": "pfcprojectdata",
+    "pg_schema": "dbo",
+    "pg_table": "pfcprojectdata",
+    "watermark_col": "t_stamp",
+    "watermark_type": "datetime",
+    "pk_cols": ["pfcprojectdata_ndx"],
+    "columns": [
+      "pfcprojectdata_ndx", "total_apparent_energy", "total_capacitive_reactive_energy",
+      "total_exported_active_energy", "total_imported_active_energy",
+      "total_inductive_reactive_energy", "current_daily_avg", "l1_current_daily_avg",
+      "l1_voltage_daily_avg", "l1_l2_voltage_daily_avg", "l2_current_daily_avg",
+      "l2_voltage_daily_avg", "l2_l3_voltage_daily_avg", "l3_current_daily_avg",
+      "l3_voltage_daily_avg", "l3_l1_voltage_daily_avg", "reactive_power_daily_avg",
+      "voltage_daily_avg", "active_power_daily_avg", "apparent_power_daily_avg",
+      "job_number", "capbank_number", "power_factor_daily_avg", "t_stamp"
+    ]
+  }
+]
