@@ -250,18 +250,17 @@ def build_mssql_query(table: dict, since) -> str:
         threshold = int(since) - table["lookback_ms"]
         where = f"[{wm}] >= {threshold}"
     else:
-        # Apply datetime lookback to avoid missing boundary rows
         from datetime import timedelta
         try:
             since_dt = datetime.fromisoformat(since)
             since_dt = since_dt - timedelta(seconds=DATETIME_LOOKBACK_SECONDS)
-            since_str = since_dt.isoformat().replace("+00:00", "")
+            # Truncate to milliseconds — Azure SQL rejects microsecond precision
+            since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{since_dt.microsecond // 1000:03d}"
         except (ValueError, TypeError):
             since_str = since
         where = f"[{wm}] >= '{since_str}'"
 
     return f"SELECT {cols} FROM [{t}] WHERE {where} ORDER BY [{wm}] ASC"
-
 
 def normalize_row(row: dict) -> dict:
     """Return a copy of the row dict with all keys lowercased.
