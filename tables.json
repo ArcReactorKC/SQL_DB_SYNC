@@ -1,0 +1,191 @@
+[
+  {
+    "mssql_table": "aescashflowsystemlogs",
+    "pg_schema": "dbo",
+    "pg_table": "aescashflowsystemlogs",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "username", "systemid", "action", "datatype", "data"]
+  },
+  {
+    "mssql_table": "aescontacts",
+    "pg_schema": "dbo",
+    "pg_table": "aescontacts",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "name", "email"]
+  },
+  {
+    "mssql_table": "apikey",
+    "pg_schema": "dbo",
+    "pg_table": "apikey",
+    "watermark_col": "createddate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "userauthid", "environment", "keytype", "createddate", "expirydate", "cancelleddate", "notes", "refid", "refidstr", "meta"]
+  },
+  {
+    "mssql_table": "appuser",
+    "pg_schema": "dbo",
+    "pg_table": "appuser",
+    "watermark_col": "modifieddate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["profileurl", "lastloginip", "lastlogindate", "id", "username", "email", "primaryemail", "phonenumber", "firstname", "lastname", "displayname", "company", "birthdate", "birthdateraw", "address", "address2", "city", "state", "country", "culture", "fullname", "gender", "language", "mailaddress", "nickname", "postalcode", "timezone", "salt", "passwordhash", "digestha1hash", "roles", "permissions", "createddate", "modifieddate", "invalidloginattempts", "lastloginattempt", "lockeddate", "recoverytoken", "refid", "refidstr", "meta"]
+  },
+  {
+    "mssql_table": "borrowingbaseinvoices",
+    "pg_schema": "dbo",
+    "pg_table": "borrowingbaseinvoices",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "customer", "invoicenumber", "invoicereference", "invoicedate", "duedate", "expecteddate", "balancedue", "ispreferredcustomer"]
+  },
+  {
+    "mssql_table": "cacheentry",
+    "pg_schema": "dbo",
+    "pg_table": "cacheentry",
+    "watermark_col": "modifieddate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "data", "expirydate", "createddate", "modifieddate"]
+  },
+  {
+    "mssql_table": "cashs",
+    "pg_schema": "dbo",
+    "pg_table": "cashs",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "bank", "amount"]
+  },
+  {
+    "mssql_table": "contactnotes",
+    "pg_schema": "dbo",
+    "pg_table": "contactnotes",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "xeroid", "aesuser", "note"]
+  },
+  {
+    "mssql_table": "creditcards",
+    "pg_schema": "dbo",
+    "pg_table": "creditcards",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "label", "amount"]
+  },
+  {
+    "mssql_table": "expensifys",
+    "pg_schema": "dbo",
+    "pg_table": "expensifys",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "label", "amount"]
+  },
+  {
+    "mssql_table": "forecastborrowingbases",
+    "pg_schema": "dbo",
+    "pg_table": "forecastborrowingbases",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "amount"]
+  },
+  {
+    "mssql_table": "invoices",
+    "pg_schema": "dbo",
+    "pg_table": "invoices",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "customer", "invoicenumber", "invoicereference", "invoicedate", "duedate", "expecteddate", "balancedue", "aescontact", "xerocontactid", "invoicexeroid"]
+  },
+  {
+    "mssql_table": "lineofcredits",
+    "pg_schema": "dbo",
+    "pg_table": "lineofcredits",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "bank", "amount", "balance"]
+  },
+  {
+    "mssql_table": "payabledisputes",
+    "pg_schema": "dbo",
+    "pg_table": "payabledisputes",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "date", "amount", "note"]
+  },
+  {
+    "mssql_table": "payables",
+    "pg_schema": "dbo",
+    "pg_table": "payables",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "vendor", "invoicenumber", "invoicedate", "duedate", "expecteddate", "balancedue", "location", "aescontact", "xerocontactid"]
+  },
+  {
+    "mssql_table": "payrolls",
+    "pg_schema": "dbo",
+    "pg_table": "payrolls",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "label", "amount"]
+  },
+  {
+    "mssql_table": "userauthdetails",
+    "pg_schema": "dbo",
+    "pg_table": "userauthdetails",
+    "watermark_col": "modifieddate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "userauthid", "provider", "userid", "username", "fullname", "displayname", "firstname", "lastname", "company", "email", "phonenumber", "birthdate", "birthdateraw", "address", "address2", "city", "state", "country", "culture", "gender", "language", "mailaddress", "nickname", "postalcode", "timezone", "refreshtoken", "refreshtokenexpiry", "requesttoken", "requesttokensecret", "items", "accesstoken", "accesstokensecret", "createddate", "modifieddate", "refid", "refidstr", "meta"]
+  },
+  {
+    "mssql_table": "userauthrole",
+    "pg_schema": "dbo",
+    "pg_table": "userauthrole",
+    "watermark_col": "modifieddate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "userauthid", "role", "permission", "createddate", "modifieddate", "refid", "refidstr", "meta"]
+  },
+  {
+    "mssql_table": "xeroaescontacts",
+    "pg_schema": "dbo",
+    "pg_table": "xeroaescontacts",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "aescontactid", "xerocontactid"]
+  },
+  {
+    "mssql_table": "xerocontacts",
+    "pg_schema": "dbo",
+    "pg_table": "xerocontacts",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "xeroid", "name"]
+  },
+  {
+    "mssql_table": "xerotokens",
+    "pg_schema": "dbo",
+    "pg_table": "xerotokens",
+    "watermark_col": "entrydate",
+    "watermark_type": "datetime",
+    "pk_cols": ["id"],
+    "columns": ["id", "entrydate", "state", "username", "tenants", "accesstoken", "refreshtoken", "idtoken", "expiresatutc"]
+  }
+]
