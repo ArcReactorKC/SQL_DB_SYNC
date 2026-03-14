@@ -262,6 +262,7 @@ def build_mssql_query(table: dict, since) -> str:
 
     return f"SELECT {cols} FROM [{t}] WHERE {where} ORDER BY [{wm}] ASC"
 
+
 def normalize_row(row: dict) -> dict:
     """Return a copy of the row dict with all keys lowercased.
     pymssql as_dict=True returns columns in their original DB casing
@@ -346,9 +347,11 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
             if table["watermark_type"] == "epoch_ms":
                 latest_wm = int(last_val)
             else:
-                latest_wm = (last_val.isoformat()
-                             if hasattr(last_val, "isoformat")
-                             else str(last_val))
+                if hasattr(last_val, "isoformat"):
+                    # Truncate to milliseconds — Azure SQL rejects microsecond precision
+                    latest_wm = last_val.strftime("%Y-%m-%dT%H:%M:%S.") + f"{last_val.microsecond // 1000:03d}"
+                else:
+                    latest_wm = str(last_val)
 
         log.info(f"[{name}] ... {total} rows inserted/updated")
 
