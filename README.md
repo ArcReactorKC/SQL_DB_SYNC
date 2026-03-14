@@ -1,4 +1,4 @@
-# ignition-sync / Energy_Projects_syncer
+# ignition-sync / AesCashFlow sync
 
 Incremental sync of Ignition historian tables from Azure SQL (MSSQL) to a local PostgreSQL instance. A **single Docker image** handles any number of databases — each database gets its own container instance configured entirely via environment variables and an optional `tables.json` file.
 
