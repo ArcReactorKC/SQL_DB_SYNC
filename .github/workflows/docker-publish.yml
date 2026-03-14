@@ -2,7 +2,7 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "AesCashFlow"]  # add each DB branch here
     tags: ["v*.*.*"]
   pull_request:
     branches: ["main"]
@@ -38,6 +38,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
             type=semver,pattern={{version}}
             type=sha,prefix=sha-,format=short
 
