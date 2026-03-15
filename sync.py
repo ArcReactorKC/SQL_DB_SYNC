@@ -10,8 +10,9 @@ import os
 import re
 import json
 import time
+import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pymssql
@@ -45,17 +46,17 @@ PG_DB          = os.getenv("PG_DB",          "")
 
 CHUNK_SIZE     = int(os.getenv("CHUNK_SIZE", "5000"))
 WATERMARK_FILE = Path(os.getenv("WATERMARK_FILE", "/data/watermarks.json"))
-
-# Path to optional tables.json defining static tables to sync.
-# If not set or file doesn't exist, only sqlt_data tables are synced.
 TABLES_CONFIG  = Path(os.getenv("TABLES_CONFIG", "/config/tables.json"))
 
-# How many previous months to include alongside the current sqlt_data month.
-# 0 = current month only, 1 = current + previous (safe around month rollover)
 SQLT_LOOKBACK_MONTHS = int(os.getenv("SQLT_LOOKBACK_MONTHS", "1"))
+SQLT_DISCOVERY       = os.getenv("SQLT_DISCOVERY", "true").lower() == "true"
 
-# Set to "false" to disable sqlt_data auto-discovery (for non-historian DBs)
-SQLT_DISCOVERY = os.getenv("SQLT_DISCOVERY", "true").lower() == "true"
+# Set to "true" on first run to pull all historical data instead of 2h lookback
+INITIAL_LOAD = os.getenv("INITIAL_LOAD", "false").lower() == "true"
+
+# Safety overlap for datetime watermarks (seconds). Prevents missing rows
+# written right at the boundary. Default 60s.
+DATETIME_LOOKBACK_SECONDS = int(os.getenv("DATETIME_LOOKBACK_SECONDS", "60"))
 
 # ---------------------------------------------------------------------------
 # Validate required config
@@ -88,7 +89,6 @@ def load_tables_config() -> list[dict]:
 
     log.info(f"Loaded {len(tables)} static table(s) from {TABLES_CONFIG}")
 
-    # Validate required fields
     required = {"mssql_table", "pg_schema", "pg_table", "watermark_col",
                 "watermark_type", "pk_cols", "columns"}
     for t in tables:
@@ -96,7 +96,9 @@ def load_tables_config() -> list[dict]:
         if missing:
             raise ValueError(f"Table '{t.get('mssql_table', '?')}' missing fields: {missing}")
         if "lookback_ms" not in t:
-            t["lookback_ms"] = 60_000   # default 1 minute safety overlap
+            t["lookback_ms"] = 60_000
+        if "sync_mode" not in t:
+            t["sync_mode"] = "incremental"  # default; also supports "full_replace"
 
     return tables
 
@@ -158,6 +160,7 @@ def discover_sqlt_tables(ms_conn) -> list[dict]:
             "pk_cols":        ["tagid", "t_stamp"],
             "columns":        SQLT_COLUMNS,
             "lookback_ms":    60_000,
+            "sync_mode":      "incremental",
         })
         log.info(f"[discovery] Found sqlt table: {schema}.{tname}")
 
@@ -205,10 +208,18 @@ def save_watermarks(wm: dict):
 
 
 def get_default_watermark(table: dict) -> int | str:
-    """Return a safe default watermark when no prior run exists (2h ago)."""
+    """
+    Return starting watermark for a table with no prior run.
+    INITIAL_LOAD=true  → epoch start (pulls everything)
+    INITIAL_LOAD=false → 2 hours ago (normal incremental default)
+    """
     if table["watermark_type"] == "epoch_ms":
+        if INITIAL_LOAD:
+            return 0
         return int(time.time() * 1000) - (2 * 3600 * 1000)
     else:
+        if INITIAL_LOAD:
+            return "1970-01-01T00:00:00"
         dt = datetime.now(timezone.utc).replace(microsecond=0)
         return (dt.replace(hour=0, minute=0, second=0)
                   .isoformat()
@@ -240,9 +251,29 @@ def build_mssql_query(table: dict, since) -> str:
         threshold = int(since) - table["lookback_ms"]
         where = f"[{wm}] >= {threshold}"
     else:
-        where = f"[{wm}] >= '{since}'"
+        try:
+            since_dt = datetime.fromisoformat(since)
+            since_dt = since_dt - timedelta(seconds=DATETIME_LOOKBACK_SECONDS)
+            # Truncate to milliseconds — Azure SQL rejects microsecond precision
+            since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{since_dt.microsecond // 1000:03d}"
+        except (ValueError, TypeError):
+            since_str = since
+        where = f"[{wm}] >= '{since_str}'"
 
     return f"SELECT {cols} FROM [{t}] WHERE {where} ORDER BY [{wm}] ASC"
+
+
+def normalize_row(row: dict) -> dict:
+    """Return a copy of the row dict with all keys lowercased.
+    Also converts UUID types to strings for psycopg2 compatibility.
+    pymssql as_dict=True returns columns in their original DB casing
+    (e.g. 'EntryDate') which won't match our lowercase tables.json keys."""
+    result = {}
+    for k, v in row.items():
+        if isinstance(v, uuid.UUID):
+            v = str(v)
+        result[k.lower()] = v
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +318,7 @@ def build_upsert_sql(table: dict) -> str:
 # Core sync logic
 # ---------------------------------------------------------------------------
 
-def sync_table(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
+def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
     name   = table["mssql_table"]
     wm_key = name
 
@@ -309,6 +340,7 @@ def sync_table(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
         if not rows:
             break
 
+        rows = [normalize_row(r) for r in rows]
         data = [tuple(row[c] for c in table["columns"]) for row in rows]
         psycopg2.extras.execute_batch(pg_cur, upsert_sql, data, page_size=CHUNK_SIZE)
         pg_conn.commit()
@@ -321,9 +353,11 @@ def sync_table(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
             if table["watermark_type"] == "epoch_ms":
                 latest_wm = int(last_val)
             else:
-                latest_wm = (last_val.isoformat()
-                             if hasattr(last_val, "isoformat")
-                             else str(last_val))
+                if hasattr(last_val, "isoformat"):
+                    # Truncate to milliseconds — Azure SQL rejects microsecond precision
+                    latest_wm = last_val.strftime("%Y-%m-%dT%H:%M:%S.") + f"{last_val.microsecond // 1000:03d}"
+                else:
+                    latest_wm = str(last_val)
 
         log.info(f"[{name}] ... {total} rows inserted/updated")
 
@@ -338,6 +372,52 @@ def sync_table(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
     return total
 
 
+def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
+    """Truncate the PG table and reload all rows from MSSQL.
+    Used for small reference tables with no reliable watermark column."""
+    name   = table["mssql_table"]
+    schema = table["pg_schema"]
+    tname  = table["pg_table"]
+    cols   = ", ".join(f"[{c}]" for c in table["columns"])
+    query  = f"SELECT {cols} FROM [{name}]"
+
+    log.info(f"[{name}] Full replace mode — truncating {schema}.{tname} ...")
+
+    ms_cur = ms_conn.cursor()
+    ms_cur.execute(query)
+
+    pg_cur = pg_conn.cursor()
+    pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}"')
+
+    upsert_sql = (
+        f'INSERT INTO "{schema}"."{tname}" ({", ".join(table["columns"])}) '
+        f'VALUES ({", ".join(["%s"] * len(table["columns"]))})'
+    )
+
+    total = 0
+    while True:
+        rows = ms_cur.fetchmany(CHUNK_SIZE)
+        if not rows:
+            break
+        rows = [normalize_row(r) for r in rows]
+        data = [tuple(row[c] for c in table["columns"]) for row in rows]
+        psycopg2.extras.execute_batch(pg_cur, upsert_sql, data, page_size=CHUNK_SIZE)
+        total += len(rows)
+        log.info(f"[{name}] ... {total} rows loaded")
+
+    pg_conn.commit()
+    ms_cur.close()
+    pg_cur.close()
+    log.info(f"[{name}] Full replace done. {total} rows.")
+    return total
+
+
+def sync_table(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
+    if table.get("sync_mode") == "full_replace":
+        return sync_table_full_replace(table, ms_conn, pg_conn)
+    return sync_table_incremental(table, watermarks, ms_conn, pg_conn)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -345,6 +425,8 @@ def sync_table(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
 def main():
     validate_config()
     log.info(f"=== Ignition Sync Starting === DB: {MSSQL_DB} -> {PG_DB}")
+    if INITIAL_LOAD:
+        log.info("*** INITIAL_LOAD=true — pulling all historical data ***")
     watermarks = load_watermarks()
 
     try:
@@ -362,14 +444,11 @@ def main():
         ms_conn.close()
         raise
 
-    # Discover sqlt_data tables and ensure they exist in PostgreSQL
     sqlt_tables = discover_sqlt_tables(ms_conn)
     for t in sqlt_tables:
         ensure_sqlt_pg_table(pg_conn, t["pg_schema"], t["pg_table"])
 
-    # Load static tables from config file
     static_tables = load_tables_config()
-
     all_tables = sqlt_tables + static_tables
 
     if not all_tables:
