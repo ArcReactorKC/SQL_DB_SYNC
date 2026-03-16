@@ -98,9 +98,43 @@ def load_tables_config() -> list[dict]:
         if "lookback_ms" not in t:
             t["lookback_ms"] = 60_000
         if "sync_mode" not in t:
-            t["sync_mode"] = "incremental"  # default; also supports "full_replace"
+            t["sync_mode"] = "incremental"
+        if "col_map" not in t:
+            t["col_map"] = {}  # optional: {"SourceColName": "pg_col_name"}
 
     return tables
+
+# ---------------------------------------------------------------------------
+# col_map helpers
+# ---------------------------------------------------------------------------
+
+def mssql_col_name(col: str, col_map: dict) -> str:
+    """Return the MSSQL source column name for a given pg column name.
+    If col_map has a reverse mapping (pg -> mssql), use it.
+    Otherwise the col name is used as-is on both sides."""
+    # col_map is stored as {mssql_name: pg_name}, so reverse it
+    reverse = {v: k for k, v in col_map.items()}
+    return reverse.get(col, col)
+
+
+def pg_col_name(col: str, col_map: dict) -> str:
+    """Return the Postgres column name for a given column list entry.
+    col_map keys are MSSQL names, values are PG names."""
+    return col_map.get(col, col)
+
+
+def resolve_columns(table: dict):
+    """Return two parallel lists:
+    - mssql_cols: column names to use in the MSSQL SELECT (original names)
+    - pg_cols:    column names to use in the Postgres INSERT (mapped names)
+    """
+    col_map = table.get("col_map", {})
+    # tables.json 'columns' list may contain either mssql or pg names.
+    # Convention: columns list always uses MSSQL names; col_map maps mssql->pg.
+    mssql_cols = table["columns"]
+    pg_cols = [col_map.get(c, c) for c in mssql_cols]
+    return mssql_cols, pg_cols
+
 
 # ---------------------------------------------------------------------------
 # sqlt_data dynamic discovery
@@ -161,6 +195,7 @@ def discover_sqlt_tables(ms_conn) -> list[dict]:
             "columns":        SQLT_COLUMNS,
             "lookback_ms":    60_000,
             "sync_mode":      "incremental",
+            "col_map":        {},
         })
         log.info(f"[discovery] Found sqlt table: {schema}.{tname}")
 
@@ -243,8 +278,9 @@ def mssql_connect():
 
 
 def build_mssql_query(table: dict, since) -> str:
-    # MSSQL uses square-bracket quoting for column and table names
-    cols = ", ".join(f"[{c}]" for c in table["columns"])
+    # Always use original MSSQL column names (keys of col_map, or col name if no mapping)
+    mssql_cols, _ = resolve_columns(table)
+    cols = ", ".join(f"[{c}]" for c in mssql_cols)
     wm   = table["watermark_col"]
     t    = table["mssql_table"]
 
@@ -264,16 +300,22 @@ def build_mssql_query(table: dict, since) -> str:
     return f"SELECT {cols} FROM [{t}] WHERE {where} ORDER BY [{wm}] ASC"
 
 
-def normalize_row(row: dict) -> dict:
-    """Return a copy of the row dict with all keys lowercased.
-    Also converts UUID types to strings for psycopg2 compatibility.
-    pymssql as_dict=True returns columns in their original DB casing
-    (e.g. 'EntryDate') which won't match our lowercase tables.json keys."""
+def normalize_row(row: dict, col_map: dict) -> dict:
+    """Return a copy of the row dict with:
+    - all keys lowercased (pymssql returns original DB casing)
+    - UUID types converted to strings
+    - column names remapped via col_map (mssql_name -> pg_name)
+    """
+    # Build a lowercase version of col_map keys for case-insensitive matching
+    lower_col_map = {k.lower(): v for k, v in col_map.items()}
     result = {}
     for k, v in row.items():
         if isinstance(v, uuid.UUID):
             v = str(v)
-        result[k.lower()] = v
+        lower_k = k.lower()
+        # Apply col_map if present, otherwise keep lowercase key
+        mapped_k = lower_col_map.get(lower_k, lower_k)
+        result[mapped_k] = v
     return result
 
 
@@ -294,15 +336,16 @@ def pg_connect():
 def build_upsert_sql(table: dict) -> str:
     schema  = table["pg_schema"]
     tname   = table["pg_table"]
-    cols    = table["columns"]
     pk_cols = table["pk_cols"]
 
+    # Use pg column names for the INSERT
+    _, pg_cols = resolve_columns(table)
+
     # Quote all column names to handle PostgreSQL reserved words
-    # (e.g. localtimestamp, date, year, month, position, operator, etc.)
-    col_list      = ", ".join(f'"{c}"' for c in cols)
-    placeholder   = ", ".join(["%s"] * len(cols))
+    col_list      = ", ".join(f'"{c}"' for c in pg_cols)
+    placeholder   = ", ".join(["%s"] * len(pg_cols))
     conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
-    update_cols   = [c for c in cols if c not in pk_cols]
+    update_cols   = [c for c in pg_cols if c not in pk_cols]
 
     if update_cols:
         updates = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
@@ -322,8 +365,9 @@ def build_upsert_sql(table: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> int:
-    name   = table["mssql_table"]
-    wm_key = name
+    name    = table["mssql_table"]
+    wm_key  = name
+    col_map = table.get("col_map", {})
 
     since = watermarks.get(wm_key, get_default_watermark(table))
     query = build_mssql_query(table, since)
@@ -338,13 +382,15 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
     total     = 0
     latest_wm = since
 
+    _, pg_cols = resolve_columns(table)
+
     while True:
         rows = ms_cur.fetchmany(CHUNK_SIZE)
         if not rows:
             break
 
-        rows = [normalize_row(r) for r in rows]
-        data = [tuple(row[c] for c in table["columns"]) for row in rows]
+        rows = [normalize_row(r, col_map) for r in rows]
+        data = [tuple(row[c] for c in pg_cols) for row in rows]
         psycopg2.extras.execute_batch(pg_cur, upsert_sql, data, page_size=CHUNK_SIZE)
         pg_conn.commit()
 
@@ -378,12 +424,14 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     """Truncate the PG table and reload all rows from MSSQL.
     Used for tables with no reliable watermark or duplicate PKs."""
-    name   = table["mssql_table"]
-    schema = table["pg_schema"]
-    tname  = table["pg_table"]
+    name    = table["mssql_table"]
+    schema  = table["pg_schema"]
+    tname   = table["pg_table"]
+    col_map = table.get("col_map", {})
 
-    # MSSQL side: square-bracket quoting
-    cols  = ", ".join(f"[{c}]" for c in table["columns"])
+    # MSSQL side: original column names in square brackets
+    mssql_cols, pg_cols = resolve_columns(table)
+    cols  = ", ".join(f"[{c}]" for c in mssql_cols)
     query = f"SELECT {cols} FROM [{name}]"
 
     log.info(f"[{name}] Full replace mode — truncating {schema}.{tname} ...")
@@ -394,11 +442,11 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     pg_cur = pg_conn.cursor()
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}"')
 
-    # PostgreSQL side: double-quote all column names to handle reserved words
-    col_list   = ", ".join(f'"{c}"' for c in table["columns"])
+    # PostgreSQL side: double-quote pg column names to handle reserved words
+    col_list   = ", ".join(f'"{c}"' for c in pg_cols)
     upsert_sql = (
         f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
-        f'VALUES ({", ".join(["%s"] * len(table["columns"]))})'
+        f'VALUES ({", ".join(["%s"] * len(pg_cols))})'
     )
 
     total = 0
@@ -406,8 +454,8 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
         rows = ms_cur.fetchmany(CHUNK_SIZE)
         if not rows:
             break
-        rows = [normalize_row(r) for r in rows]
-        data = [tuple(row[c] for c in table["columns"]) for row in rows]
+        rows = [normalize_row(r, col_map) for r in rows]
+        data = [tuple(row[c] for c in pg_cols) for row in rows]
         psycopg2.extras.execute_batch(pg_cur, upsert_sql, data, page_size=CHUNK_SIZE)
         total += len(rows)
         log.info(f"[{name}] ... {total} rows loaded")
