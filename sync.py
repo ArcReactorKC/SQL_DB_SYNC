@@ -84,7 +84,7 @@ def load_tables_config() -> list[dict]:
         log.info(f"No tables config found at {TABLES_CONFIG} — only sqlt_data tables will be synced")
         return []
 
-    with open(TABLES_CONFIG) as f:
+    with open(TABLES_CONFIG, encoding="utf-8-sig") as f:
         tables = json.load(f)
 
     log.info(f"Loaded {len(tables)} static table(s) from {TABLES_CONFIG}")
@@ -243,6 +243,7 @@ def mssql_connect():
 
 
 def build_mssql_query(table: dict, since) -> str:
+    # MSSQL uses square-bracket quoting for column and table names
     cols = ", ".join(f"[{c}]" for c in table["columns"])
     wm   = table["watermark_col"]
     t    = table["mssql_table"]
@@ -296,13 +297,15 @@ def build_upsert_sql(table: dict) -> str:
     cols    = table["columns"]
     pk_cols = table["pk_cols"]
 
-    col_list      = ", ".join(cols)
+    # Quote all column names to handle PostgreSQL reserved words
+    # (e.g. localtimestamp, date, year, month, position, operator, etc.)
+    col_list      = ", ".join(f'"{c}"' for c in cols)
     placeholder   = ", ".join(["%s"] * len(cols))
-    conflict_cols = ", ".join(pk_cols)
+    conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
     update_cols   = [c for c in cols if c not in pk_cols]
 
     if update_cols:
-        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+        updates = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
         on_conflict = f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {updates}"
     else:
         on_conflict = f"ON CONFLICT ({conflict_cols}) DO NOTHING"
@@ -374,12 +377,14 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 
 def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     """Truncate the PG table and reload all rows from MSSQL.
-    Used for small reference tables with no reliable watermark column."""
+    Used for tables with no reliable watermark or duplicate PKs."""
     name   = table["mssql_table"]
     schema = table["pg_schema"]
     tname  = table["pg_table"]
-    cols   = ", ".join(f"[{c}]" for c in table["columns"])
-    query  = f"SELECT {cols} FROM [{name}]"
+
+    # MSSQL side: square-bracket quoting
+    cols  = ", ".join(f"[{c}]" for c in table["columns"])
+    query = f"SELECT {cols} FROM [{name}]"
 
     log.info(f"[{name}] Full replace mode — truncating {schema}.{tname} ...")
 
@@ -389,8 +394,10 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     pg_cur = pg_conn.cursor()
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}"')
 
+    # PostgreSQL side: double-quote all column names to handle reserved words
+    col_list   = ", ".join(f'"{c}"' for c in table["columns"])
     upsert_sql = (
-        f'INSERT INTO "{schema}"."{tname}" ({", ".join(table["columns"])}) '
+        f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
         f'VALUES ({", ".join(["%s"] * len(table["columns"]))})'
     )
 
