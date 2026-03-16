@@ -100,7 +100,7 @@ def load_tables_config() -> list[dict]:
         if "sync_mode" not in t:
             t["sync_mode"] = "incremental"
         if "col_map" not in t:
-            t["col_map"] = {}  # optional: {"SourceColName": "pg_col_name"}
+            t["col_map"] = {}
 
     return tables
 
@@ -108,29 +108,12 @@ def load_tables_config() -> list[dict]:
 # col_map helpers
 # ---------------------------------------------------------------------------
 
-def mssql_col_name(col: str, col_map: dict) -> str:
-    """Return the MSSQL source column name for a given pg column name.
-    If col_map has a reverse mapping (pg -> mssql), use it.
-    Otherwise the col name is used as-is on both sides."""
-    # col_map is stored as {mssql_name: pg_name}, so reverse it
-    reverse = {v: k for k, v in col_map.items()}
-    return reverse.get(col, col)
-
-
-def pg_col_name(col: str, col_map: dict) -> str:
-    """Return the Postgres column name for a given column list entry.
-    col_map keys are MSSQL names, values are PG names."""
-    return col_map.get(col, col)
-
-
 def resolve_columns(table: dict):
     """Return two parallel lists:
     - mssql_cols: column names to use in the MSSQL SELECT (original names)
     - pg_cols:    column names to use in the Postgres INSERT (mapped names)
     """
     col_map = table.get("col_map", {})
-    # tables.json 'columns' list may contain either mssql or pg names.
-    # Convention: columns list always uses MSSQL names; col_map maps mssql->pg.
     mssql_cols = table["columns"]
     pg_cols = [col_map.get(c, c) for c in mssql_cols]
     return mssql_cols, pg_cols
@@ -245,10 +228,15 @@ def save_watermarks(wm: dict):
 def get_default_watermark(table: dict) -> int | str:
     """
     Return starting watermark for a table with no prior run.
-    INITIAL_LOAD=true  → epoch start (pulls everything)
-    INITIAL_LOAD=false → 2 hours ago (normal incremental default)
+
+    watermark_type  | INITIAL_LOAD=true       | INITIAL_LOAD=false
+    ----------------|-------------------------|---------------------------
+    epoch_ms        | 0 (Unix epoch ms)       | now - 2h (ms)
+    epoch_ms_dt     | 0 (Unix epoch ms)       | now - 2h (ms)
+    datetime        | "1970-01-01T00:00:00"   | today midnight UTC
     """
-    if table["watermark_type"] == "epoch_ms":
+    wt = table["watermark_type"]
+    if wt in ("epoch_ms", "epoch_ms_datetime"):
         if INITIAL_LOAD:
             return 0
         return int(time.time() * 1000) - (2 * 3600 * 1000)
@@ -278,20 +266,45 @@ def mssql_connect():
 
 
 def build_mssql_query(table: dict, since) -> str:
-    # Always use original MSSQL column names (keys of col_map, or col name if no mapping)
+    """
+    Build the MSSQL SELECT query based on watermark type.
+
+    epoch_ms        — t_stamp is a bigint (Unix ms). WHERE t_stamp >= threshold_ms
+    epoch_ms_datetime — t_stamp is a datetime column storing Unix ms as a number
+                        (common in custom Ignition tables). We convert the stored
+                        bigint watermark back to a MSSQL datetime using DATEADD so
+                        Azure SQL does not overflow. This enables incremental sync
+                        on tables where pgloader typed the column as datetime.
+                        WHERE t_stamp >= DATEADD(ms, threshold % 86400000, 
+                                          DATEADD(day, threshold / 86400000, '19700101'))
+    datetime        — t_stamp / watermark_col is a real datetime column.
+                        WHERE col >= 'YYYY-MM-DDTHH:MM:SS.mmm'
+    """
     mssql_cols, _ = resolve_columns(table)
     cols = ", ".join(f"[{c}]" for c in mssql_cols)
     wm   = table["watermark_col"]
     t    = table["mssql_table"]
+    wt   = table["watermark_type"]
 
-    if table["watermark_type"] == "epoch_ms":
+    if wt == "epoch_ms":
         threshold = int(since) - table["lookback_ms"]
         where = f"[{wm}] >= {threshold}"
-    else:
+
+    elif wt == "epoch_ms_datetime":
+        # since is stored as Unix milliseconds integer in the watermark file.
+        # Convert to MSSQL datetime using two-stage DATEADD to avoid integer
+        # overflow (DATEADD milliseconds overflows past ~24 days from epoch).
+        threshold_ms = int(since) - table["lookback_ms"]
+        days = threshold_ms // 86_400_000
+        ms   = threshold_ms %  86_400_000
+        where = (
+            f"[{wm}] >= DATEADD(ms, {ms}, DATEADD(day, {days}, '19700101'))"
+        )
+
+    else:  # datetime
         try:
             since_dt = datetime.fromisoformat(since)
             since_dt = since_dt - timedelta(seconds=DATETIME_LOOKBACK_SECONDS)
-            # Truncate to milliseconds — Azure SQL rejects microsecond precision
             since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{since_dt.microsecond // 1000:03d}"
         except (ValueError, TypeError):
             since_str = since
@@ -302,18 +315,16 @@ def build_mssql_query(table: dict, since) -> str:
 
 def normalize_row(row: dict, col_map: dict) -> dict:
     """Return a copy of the row dict with:
-    - all keys lowercased (pymssql returns original DB casing)
+    - all keys lowercased
     - UUID types converted to strings
     - column names remapped via col_map (mssql_name -> pg_name)
     """
-    # Build a lowercase version of col_map keys for case-insensitive matching
     lower_col_map = {k.lower(): v for k, v in col_map.items()}
     result = {}
     for k, v in row.items():
         if isinstance(v, uuid.UUID):
             v = str(v)
         lower_k = k.lower()
-        # Apply col_map if present, otherwise keep lowercase key
         mapped_k = lower_col_map.get(lower_k, lower_k)
         result[mapped_k] = v
     return result
@@ -338,10 +349,8 @@ def build_upsert_sql(table: dict) -> str:
     tname   = table["pg_table"]
     pk_cols = table["pk_cols"]
 
-    # Use pg column names for the INSERT
     _, pg_cols = resolve_columns(table)
 
-    # Quote all column names to handle PostgreSQL reserved words
     col_list      = ", ".join(f'"{c}"' for c in pg_cols)
     placeholder   = ", ".join(["%s"] * len(pg_cols))
     conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
@@ -368,6 +377,7 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
     name    = table["mssql_table"]
     wm_key  = name
     col_map = table.get("col_map", {})
+    wt      = table["watermark_type"]
 
     since = watermarks.get(wm_key, get_default_watermark(table))
     query = build_mssql_query(table, since)
@@ -399,11 +409,16 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
         wm_col   = table["watermark_col"]
         last_val = rows[-1][wm_col]
         if last_val is not None:
-            if table["watermark_type"] == "epoch_ms":
-                latest_wm = int(last_val)
+            if wt in ("epoch_ms", "epoch_ms_datetime"):
+                # Both epoch types store the watermark as a Unix ms integer.
+                # For epoch_ms_datetime the value coming back from MSSQL will
+                # be a datetime object — convert it back to Unix ms.
+                if hasattr(last_val, "timestamp"):
+                    latest_wm = int(last_val.timestamp() * 1000)
+                else:
+                    latest_wm = int(last_val)
             else:
                 if hasattr(last_val, "isoformat"):
-                    # Truncate to milliseconds — Azure SQL rejects microsecond precision
                     latest_wm = last_val.strftime("%Y-%m-%dT%H:%M:%S.") + f"{last_val.microsecond // 1000:03d}"
                 else:
                     latest_wm = str(last_val)
@@ -429,7 +444,6 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     tname   = table["pg_table"]
     col_map = table.get("col_map", {})
 
-    # MSSQL side: original column names in square brackets
     mssql_cols, pg_cols = resolve_columns(table)
     cols  = ", ".join(f"[{c}]" for c in mssql_cols)
     query = f"SELECT {cols} FROM [{name}]"
@@ -442,7 +456,6 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     pg_cur = pg_conn.cursor()
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}"')
 
-    # PostgreSQL side: double-quote pg column names to handle reserved words
     col_list   = ", ".join(f'"{c}"' for c in pg_cols)
     upsert_sql = (
         f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
