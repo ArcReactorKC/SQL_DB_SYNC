@@ -249,6 +249,20 @@ def ensure_sqlt_pg_table(pg_conn, schema: str, table: str):
 # Static table schema management — create and evolve PG tables automatically
 # ---------------------------------------------------------------------------
 
+def ensure_pg_schema(pg_conn, schema: str):
+    """
+    Create the target schema if it does not already exist.
+    Called once at startup before any table operations so fresh databases
+    (e.g. newly created PG DBs with only the default 'public' schema) work
+    without manual intervention.
+    """
+    cur = pg_conn.cursor()
+    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+    pg_conn.commit()
+    cur.close()
+    log.info(f"[pg] Ensured schema {schema} exists")
+
+
 def get_mssql_column_types(ms_conn, mssql_table: str, columns: list[str]) -> dict[str, str]:
     """
     Query INFORMATION_SCHEMA.COLUMNS on MSSQL for the given table and columns.
@@ -288,8 +302,8 @@ def get_pg_existing_columns(pg_conn, schema: str, table: str) -> set[str]:
 def ensure_static_pg_table(table: dict, ms_conn, pg_conn):
     """
     Ensure the PG target table exists and contains all columns defined in
-    tables.json. If the table is missing, it is created. If it exists but is
-    missing columns (schema drift), the missing columns are added via ALTER TABLE.
+    tables.json. If the table is missing it is created. If it exists but is
+    missing columns (schema drift) the missing columns are added via ALTER TABLE.
 
     Column types are resolved by querying MSSQL INFORMATION_SCHEMA — no
     hardcoded type assumptions. col_map renaming is applied so PG always
@@ -327,7 +341,6 @@ def ensure_static_pg_table(table: dict, ms_conn, pg_conn):
         # Table does not exist — CREATE from scratch
         col_sql_parts = []
         for pg_col, pg_type in col_defs:
-            nullable = "" if pg_col in pk_cols else ""
             col_sql_parts.append(f'    "{pg_col}" {pg_type}')
 
         pk_constraint = ", ".join(f'"{c}"' for c in pk_cols)
@@ -386,7 +399,7 @@ def get_default_watermark(table: dict) -> int | str:
     watermark_type  | INITIAL_LOAD=true       | INITIAL_LOAD=false
     ----------------|-------------------------|---------------------------
     epoch_ms        | 0 (Unix epoch ms)       | now - 2h (ms)
-    epoch_ms_dt     | 0 (Unix epoch ms)       | now - 2h (ms)
+    epoch_ms_datetime | 0 (Unix epoch ms)     | now - 2h (ms)
     datetime        | "1970-01-01T00:00:00"   | today midnight UTC
     integer         | 0                       | 0 (always full for int PKs)
     string          | ""                      | ""
@@ -429,19 +442,12 @@ def build_mssql_query(table: dict, since) -> str:
     """
     Build the MSSQL SELECT query based on watermark type.
 
-    epoch_ms        — t_stamp is a bigint (Unix ms). WHERE t_stamp >= threshold_ms
-    epoch_ms_datetime — t_stamp is a datetime column storing Unix ms as a number
-                        (common in custom Ignition tables). We convert the stored
-                        bigint watermark back to a MSSQL datetime using DATEADD so
-                        Azure SQL does not overflow. This enables incremental sync
-                        on tables where pgloader typed the column as datetime.
-                        WHERE t_stamp >= DATEADD(ms, threshold % 86400000,
-                                          DATEADD(day, threshold / 86400000, '19700101'))
-    datetime        — t_stamp / watermark_col is a real datetime column.
-                        WHERE col >= 'YYYY-MM-DDTHH:MM:SS.mmm'
-    integer         — watermark_col is an integer PK.
-                        WHERE col >= since
-    string          — not used for incremental; full_replace tables only.
+    epoch_ms          — t_stamp is a bigint (Unix ms). WHERE t_stamp >= threshold_ms
+    epoch_ms_datetime — t_stamp is a datetime column storing Unix ms as a number.
+                        Convert bigint watermark to MSSQL datetime via DATEADD.
+    datetime          — real datetime column. WHERE col >= 'YYYY-MM-DDTHH:MM:SS.mmm'
+    integer           — integer PK. WHERE col >= since
+    string            — not used for incremental; full_replace tables only.
     """
     mssql_cols, _ = resolve_columns(table)
     cols = ", ".join(f"[{c}]" for c in mssql_cols)
@@ -454,9 +460,6 @@ def build_mssql_query(table: dict, since) -> str:
         where = f"[{wm}] >= {threshold}"
 
     elif wt == "epoch_ms_datetime":
-        # since is stored as Unix milliseconds integer in the watermark file.
-        # Convert to MSSQL datetime using two-stage DATEADD to avoid integer
-        # overflow (DATEADD milliseconds overflows past ~24 days from epoch).
         threshold_ms = int(since) - table["lookback_ms"]
         days = threshold_ms // 86_400_000
         ms   = threshold_ms %  86_400_000
@@ -572,17 +575,14 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 
         total += len(rows)
 
-        wm_col   = table["watermark_col"]
-        # watermark_col may be an original MSSQL name — resolve to pg name for dict lookup
+        wm_col = table["watermark_col"]
+        # Resolve watermark col through col_map to match normalized row keys
         col_map_lower = {k.lower(): v for k, v in col_map.items()}
         wm_col_pg = col_map_lower.get(wm_col.lower(), wm_col.lower())
         last_val = rows[-1].get(wm_col_pg)
 
         if last_val is not None:
             if wt in ("epoch_ms", "epoch_ms_datetime"):
-                # Both epoch types store the watermark as a Unix ms integer.
-                # For epoch_ms_datetime the value coming back from MSSQL will
-                # be a datetime object — convert it back to Unix ms.
                 if hasattr(last_val, "timestamp"):
                     latest_wm = int(last_val.timestamp() * 1000)
                 else:
@@ -685,10 +685,21 @@ def main():
         raise
 
     sqlt_tables = discover_sqlt_tables(ms_conn)
+
+    # Collect all schemas needed and ensure they exist on PG before anything else
+    all_schemas = {"dbo"}  # dbo is always needed for sqlt tables
+    static_tables = load_tables_config()
+    for t in static_tables:
+        all_schemas.add(t["pg_schema"])
+    for schema in sorted(all_schemas):
+        try:
+            ensure_pg_schema(pg_conn, schema)
+        except Exception as e:
+            log.error(f"[pg] Failed to ensure schema {schema}: {e}")
+            pg_conn.rollback()
+
     for t in sqlt_tables:
         ensure_sqlt_pg_table(pg_conn, t["pg_schema"], t["pg_table"])
-
-    static_tables = load_tables_config()
 
     # Ensure all static PG tables exist and are schema-current before syncing
     for t in static_tables:
