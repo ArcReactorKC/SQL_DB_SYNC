@@ -59,6 +59,43 @@ INITIAL_LOAD = os.getenv("INITIAL_LOAD", "false").lower() == "true"
 DATETIME_LOOKBACK_SECONDS = int(os.getenv("DATETIME_LOOKBACK_SECONDS", "60"))
 
 # ---------------------------------------------------------------------------
+# MSSQL -> PostgreSQL type mapping
+# ---------------------------------------------------------------------------
+MSSQL_TO_PG_TYPE = {
+    "int":              "integer",
+    "bigint":           "bigint",
+    "smallint":         "smallint",
+    "tinyint":          "smallint",
+    "bit":              "boolean",
+    "float":            "double precision",
+    "real":             "real",
+    "decimal":          "numeric",
+    "numeric":          "numeric",
+    "money":            "numeric(19,4)",
+    "smallmoney":       "numeric(10,4)",
+    "datetime":         "timestamptz",
+    "datetime2":        "timestamptz",
+    "smalldatetime":    "timestamptz",
+    "date":             "date",
+    "time":             "time",
+    "char":             "text",
+    "varchar":          "text",
+    "nchar":            "text",
+    "nvarchar":         "text",
+    "text":             "text",
+    "ntext":            "text",
+    "uniqueidentifier": "uuid",
+    "binary":           "bytea",
+    "varbinary":        "bytea",
+    "xml":              "text",
+}
+
+
+def mssql_type_to_pg(mssql_type: str) -> str:
+    return MSSQL_TO_PG_TYPE.get(mssql_type.lower(), "text")
+
+
+# ---------------------------------------------------------------------------
 # Validate required config
 # ---------------------------------------------------------------------------
 def validate_config():
@@ -100,7 +137,7 @@ def load_tables_config() -> list[dict]:
         if "sync_mode" not in t:
             t["sync_mode"] = "incremental"
         if "col_map" not in t:
-            t["col_map"] = {}  # optional: {"SourceColName": "pg_col_name"}
+            t["col_map"] = {}
 
     return tables
 
@@ -108,29 +145,12 @@ def load_tables_config() -> list[dict]:
 # col_map helpers
 # ---------------------------------------------------------------------------
 
-def mssql_col_name(col: str, col_map: dict) -> str:
-    """Return the MSSQL source column name for a given pg column name.
-    If col_map has a reverse mapping (pg -> mssql), use it.
-    Otherwise the col name is used as-is on both sides."""
-    # col_map is stored as {mssql_name: pg_name}, so reverse it
-    reverse = {v: k for k, v in col_map.items()}
-    return reverse.get(col, col)
-
-
-def pg_col_name(col: str, col_map: dict) -> str:
-    """Return the Postgres column name for a given column list entry.
-    col_map keys are MSSQL names, values are PG names."""
-    return col_map.get(col, col)
-
-
 def resolve_columns(table: dict):
     """Return two parallel lists:
     - mssql_cols: column names to use in the MSSQL SELECT (original names)
     - pg_cols:    column names to use in the Postgres INSERT (mapped names)
     """
     col_map = table.get("col_map", {})
-    # tables.json 'columns' list may contain either mssql or pg names.
-    # Convention: columns list always uses MSSQL names; col_map maps mssql->pg.
     mssql_cols = table["columns"]
     pg_cols = [col_map.get(c, c) for c in mssql_cols]
     return mssql_cols, pg_cols
@@ -226,6 +246,136 @@ def ensure_sqlt_pg_table(pg_conn, schema: str, table: str):
 
 
 # ---------------------------------------------------------------------------
+# Static table schema management — create and evolve PG tables automatically
+# ---------------------------------------------------------------------------
+
+def ensure_pg_schema(pg_conn, schema: str):
+    """
+    Create the target schema if it does not already exist.
+    Called once at startup before any table operations so fresh databases
+    (e.g. newly created PG DBs with only the default 'public' schema) work
+    without manual intervention.
+    """
+    cur = pg_conn.cursor()
+    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+    pg_conn.commit()
+    cur.close()
+    log.info(f"[pg] Ensured schema {schema} exists")
+
+
+def get_mssql_column_types(ms_conn, mssql_table: str, columns: list[str]) -> dict[str, str]:
+    """
+    Query INFORMATION_SCHEMA.COLUMNS on MSSQL for the given table and columns.
+    Returns a dict of {original_column_name: mssql_data_type}.
+    """
+    placeholders = ", ".join(["%s"] * len(columns))
+    sql = f"""
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = %s
+          AND COLUMN_NAME IN ({placeholders})
+    """
+    cur = ms_conn.cursor()
+    cur.execute(sql, [mssql_table] + list(columns))
+    rows = cur.fetchall()
+    cur.close()
+    return {row["COLUMN_NAME"]: row["DATA_TYPE"] for row in rows}
+
+
+def get_pg_existing_columns(pg_conn, schema: str, table: str) -> set[str]:
+    """
+    Return the set of column names already present in the PG table (lowercased).
+    Returns empty set if the table does not exist yet.
+    """
+    sql = """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+    """
+    cur = pg_conn.cursor()
+    cur.execute(sql, [schema, table])
+    rows = cur.fetchall()
+    cur.close()
+    return {row[0].lower() for row in rows}
+
+
+def ensure_static_pg_table(table: dict, ms_conn, pg_conn):
+    """
+    Ensure the PG target table exists and contains all columns defined in
+    tables.json. If the table is missing it is created. If it exists but is
+    missing columns (schema drift) the missing columns are added via ALTER TABLE.
+
+    Column types are resolved by querying MSSQL INFORMATION_SCHEMA — no
+    hardcoded type assumptions. col_map renaming is applied so PG always
+    receives the mapped column name.
+
+    PKs are set only on CREATE; ALTER TABLE never drops or recreates PKs.
+    """
+    mssql_table = table["mssql_table"]
+    schema      = table["pg_schema"]
+    pg_table    = table["pg_table"]
+    pk_cols     = table["pk_cols"]
+    col_map     = table.get("col_map", {})
+
+    mssql_cols, pg_cols = resolve_columns(table)
+
+    # --- fetch MSSQL types for all columns in this table ---
+    try:
+        mssql_types = get_mssql_column_types(ms_conn, mssql_table, mssql_cols)
+    except Exception as e:
+        log.warning(f"[schema] Could not fetch MSSQL column types for {mssql_table}: {e}")
+        mssql_types = {}
+
+    # Build ordered list of (pg_col_name, pg_type) pairs
+    col_defs = []
+    for mssql_col, pg_col in zip(mssql_cols, pg_cols):
+        mssql_type = mssql_types.get(mssql_col, "nvarchar")
+        pg_type    = mssql_type_to_pg(mssql_type)
+        col_defs.append((pg_col, pg_type))
+
+    existing_cols = get_pg_existing_columns(pg_conn, schema, pg_table)
+
+    cur = pg_conn.cursor()
+
+    if not existing_cols:
+        # Table does not exist — CREATE from scratch
+        col_sql_parts = []
+        for pg_col, pg_type in col_defs:
+            col_sql_parts.append(f'    "{pg_col}" {pg_type}')
+
+        pk_constraint = ", ".join(f'"{c}"' for c in pk_cols)
+        col_sql_parts.append(f"    PRIMARY KEY ({pk_constraint})")
+
+        create_sql = (
+            f'CREATE TABLE IF NOT EXISTS "{schema}"."{pg_table}" (\n'
+            + ",\n".join(col_sql_parts)
+            + "\n);"
+        )
+        log.info(f"[schema] Creating table {schema}.{pg_table}")
+        cur.execute(create_sql)
+        pg_conn.commit()
+        log.info(f"[schema] Created {schema}.{pg_table} with {len(col_defs)} columns")
+
+    else:
+        # Table exists — check for missing columns and ALTER TABLE to add them
+        added = []
+        for pg_col, pg_type in col_defs:
+            if pg_col.lower() not in existing_cols:
+                alter_sql = f'ALTER TABLE "{schema}"."{pg_table}" ADD COLUMN "{pg_col}" {pg_type};'
+                log.info(f"[schema] Adding missing column: {schema}.{pg_table}.{pg_col} ({pg_type})")
+                cur.execute(alter_sql)
+                added.append(pg_col)
+
+        if added:
+            pg_conn.commit()
+            log.info(f"[schema] Schema drift fixed for {schema}.{pg_table} — added: {', '.join(added)}")
+        else:
+            log.info(f"[pg] Ensured table {schema}.{pg_table} exists (no drift)")
+
+    cur.close()
+
+
+# ---------------------------------------------------------------------------
 # Watermark persistence
 # ---------------------------------------------------------------------------
 
@@ -245,14 +395,25 @@ def save_watermarks(wm: dict):
 def get_default_watermark(table: dict) -> int | str:
     """
     Return starting watermark for a table with no prior run.
-    INITIAL_LOAD=true  → epoch start (pulls everything)
-    INITIAL_LOAD=false → 2 hours ago (normal incremental default)
+
+    watermark_type  | INITIAL_LOAD=true       | INITIAL_LOAD=false
+    ----------------|-------------------------|---------------------------
+    epoch_ms        | 0 (Unix epoch ms)       | now - 2h (ms)
+    epoch_ms_datetime | 0 (Unix epoch ms)     | now - 2h (ms)
+    datetime        | "1970-01-01T00:00:00"   | today midnight UTC
+    integer         | 0                       | 0 (always full for int PKs)
+    string          | ""                      | ""
     """
-    if table["watermark_type"] == "epoch_ms":
+    wt = table["watermark_type"]
+    if wt in ("epoch_ms", "epoch_ms_datetime"):
         if INITIAL_LOAD:
             return 0
         return int(time.time() * 1000) - (2 * 3600 * 1000)
-    else:
+    elif wt == "integer":
+        return 0
+    elif wt == "string":
+        return ""
+    else:  # datetime
         if INITIAL_LOAD:
             return "1970-01-01T00:00:00"
         dt = datetime.now(timezone.utc).replace(microsecond=0)
@@ -278,20 +439,41 @@ def mssql_connect():
 
 
 def build_mssql_query(table: dict, since) -> str:
-    # Always use original MSSQL column names (keys of col_map, or col name if no mapping)
+    """
+    Build the MSSQL SELECT query based on watermark type.
+
+    epoch_ms          — t_stamp is a bigint (Unix ms). WHERE t_stamp >= threshold_ms
+    epoch_ms_datetime — t_stamp is a datetime column storing Unix ms as a number.
+                        Convert bigint watermark to MSSQL datetime via DATEADD.
+    datetime          — real datetime column. WHERE col >= 'YYYY-MM-DDTHH:MM:SS.mmm'
+    integer           — integer PK. WHERE col >= since
+    string            — not used for incremental; full_replace tables only.
+    """
     mssql_cols, _ = resolve_columns(table)
     cols = ", ".join(f"[{c}]" for c in mssql_cols)
     wm   = table["watermark_col"]
     t    = table["mssql_table"]
+    wt   = table["watermark_type"]
 
-    if table["watermark_type"] == "epoch_ms":
+    if wt == "epoch_ms":
         threshold = int(since) - table["lookback_ms"]
         where = f"[{wm}] >= {threshold}"
-    else:
+
+    elif wt == "epoch_ms_datetime":
+        threshold_ms = int(since) - table["lookback_ms"]
+        days = threshold_ms // 86_400_000
+        ms   = threshold_ms %  86_400_000
+        where = (
+            f"[{wm}] >= DATEADD(ms, {ms}, DATEADD(day, {days}, '19700101'))"
+        )
+
+    elif wt == "integer":
+        where = f"[{wm}] >= {int(since)}"
+
+    else:  # datetime
         try:
             since_dt = datetime.fromisoformat(since)
             since_dt = since_dt - timedelta(seconds=DATETIME_LOOKBACK_SECONDS)
-            # Truncate to milliseconds — Azure SQL rejects microsecond precision
             since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{since_dt.microsecond // 1000:03d}"
         except (ValueError, TypeError):
             since_str = since
@@ -302,18 +484,16 @@ def build_mssql_query(table: dict, since) -> str:
 
 def normalize_row(row: dict, col_map: dict) -> dict:
     """Return a copy of the row dict with:
-    - all keys lowercased (pymssql returns original DB casing)
+    - all keys lowercased
     - UUID types converted to strings
     - column names remapped via col_map (mssql_name -> pg_name)
     """
-    # Build a lowercase version of col_map keys for case-insensitive matching
     lower_col_map = {k.lower(): v for k, v in col_map.items()}
     result = {}
     for k, v in row.items():
         if isinstance(v, uuid.UUID):
             v = str(v)
         lower_k = k.lower()
-        # Apply col_map if present, otherwise keep lowercase key
         mapped_k = lower_col_map.get(lower_k, lower_k)
         result[mapped_k] = v
     return result
@@ -338,10 +518,8 @@ def build_upsert_sql(table: dict) -> str:
     tname   = table["pg_table"]
     pk_cols = table["pk_cols"]
 
-    # Use pg column names for the INSERT
     _, pg_cols = resolve_columns(table)
 
-    # Quote all column names to handle PostgreSQL reserved words
     col_list      = ", ".join(f'"{c}"' for c in pg_cols)
     placeholder   = ", ".join(["%s"] * len(pg_cols))
     conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
@@ -368,6 +546,7 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
     name    = table["mssql_table"]
     wm_key  = name
     col_map = table.get("col_map", {})
+    wt      = table["watermark_type"]
 
     since = watermarks.get(wm_key, get_default_watermark(table))
     query = build_mssql_query(table, since)
@@ -396,14 +575,22 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 
         total += len(rows)
 
-        wm_col   = table["watermark_col"]
-        last_val = rows[-1][wm_col]
+        wm_col = table["watermark_col"]
+        # Resolve watermark col through col_map to match normalized row keys
+        col_map_lower = {k.lower(): v for k, v in col_map.items()}
+        wm_col_pg = col_map_lower.get(wm_col.lower(), wm_col.lower())
+        last_val = rows[-1].get(wm_col_pg)
+
         if last_val is not None:
-            if table["watermark_type"] == "epoch_ms":
+            if wt in ("epoch_ms", "epoch_ms_datetime"):
+                if hasattr(last_val, "timestamp"):
+                    latest_wm = int(last_val.timestamp() * 1000)
+                else:
+                    latest_wm = int(last_val)
+            elif wt == "integer":
                 latest_wm = int(last_val)
             else:
                 if hasattr(last_val, "isoformat"):
-                    # Truncate to milliseconds — Azure SQL rejects microsecond precision
                     latest_wm = last_val.strftime("%Y-%m-%dT%H:%M:%S.") + f"{last_val.microsecond // 1000:03d}"
                 else:
                     latest_wm = str(last_val)
@@ -429,7 +616,6 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     tname   = table["pg_table"]
     col_map = table.get("col_map", {})
 
-    # MSSQL side: original column names in square brackets
     mssql_cols, pg_cols = resolve_columns(table)
     cols  = ", ".join(f"[{c}]" for c in mssql_cols)
     query = f"SELECT {cols} FROM [{name}]"
@@ -442,7 +628,6 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     pg_cur = pg_conn.cursor()
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}"')
 
-    # PostgreSQL side: double-quote pg column names to handle reserved words
     col_list   = ", ".join(f'"{c}"' for c in pg_cols)
     upsert_sql = (
         f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
@@ -500,10 +685,30 @@ def main():
         raise
 
     sqlt_tables = discover_sqlt_tables(ms_conn)
+
+    # Collect all schemas needed and ensure they exist on PG before anything else
+    all_schemas = {"dbo"}  # dbo is always needed for sqlt tables
+    static_tables = load_tables_config()
+    for t in static_tables:
+        all_schemas.add(t["pg_schema"])
+    for schema in sorted(all_schemas):
+        try:
+            ensure_pg_schema(pg_conn, schema)
+        except Exception as e:
+            log.error(f"[pg] Failed to ensure schema {schema}: {e}")
+            pg_conn.rollback()
+
     for t in sqlt_tables:
         ensure_sqlt_pg_table(pg_conn, t["pg_schema"], t["pg_table"])
 
-    static_tables = load_tables_config()
+    # Ensure all static PG tables exist and are schema-current before syncing
+    for t in static_tables:
+        try:
+            ensure_static_pg_table(t, ms_conn, pg_conn)
+        except Exception as e:
+            log.error(f"[schema] Failed to ensure table {t['pg_table']}: {e}")
+            pg_conn.rollback()
+
     all_tables = sqlt_tables + static_tables
 
     if not all_tables:
