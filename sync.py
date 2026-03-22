@@ -610,7 +610,8 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 
 def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     """Truncate the PG table and reload all rows from MSSQL.
-    Used for tables with no reliable watermark or duplicate PKs."""
+    Used for tables with no reliable watermark or duplicate PKs.
+    Uses TRUNCATE ... CASCADE to handle any foreign key dependencies."""
     name    = table["mssql_table"]
     schema  = table["pg_schema"]
     tname   = table["pg_table"]
@@ -626,7 +627,9 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     ms_cur.execute(query)
 
     pg_cur = pg_conn.cursor()
-    pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}"')
+    # CASCADE ensures dependent tables are also truncated, preventing
+    # duplicate key errors when foreign key constraints exist
+    pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}" CASCADE')
 
     col_list   = ", ".join(f'"{c}"' for c in pg_cols)
     upsert_sql = (
