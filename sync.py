@@ -628,8 +628,11 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
 
     pg_cur = pg_conn.cursor()
     # CASCADE ensures dependent tables are also truncated, preventing
-    # duplicate key errors when foreign key constraints exist
+    # duplicate key errors when foreign key constraints exist.
+    # Commit immediately so the TRUNCATE cannot be rolled back by a
+    # subsequent INSERT failure, which would leave stale data in place.
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}" CASCADE')
+    pg_conn.commit()
 
     col_list   = ", ".join(f'"{c}"' for c in pg_cols)
     upsert_sql = (
