@@ -2,7 +2,7 @@ name: Build and Publish Docker Image
 
 on:
   push:
-    branches: ["main", "AesCashFlow", "AesFunnelMgr"]  # add each DB branch here
+    branches: ["main", "AesCashFlow", "AesFunnelMgr", "AesRng", "allyRisk", "allySolar", "beardstown", "dalhart", "JBS-IGNITION-01", "JbsBiogas", "KnowCarbon", "marshalltown", "NB-Covid-Response", "ottumwa", "SMaRT-System", "smd"]  # add each DB branch here
     tags: ["v*.*.*"]
   pull_request:
     branches: ["main"]
