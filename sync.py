@@ -610,8 +610,9 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 
 def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     """Truncate the PG table and reload all rows from MSSQL.
-    Used for tables with no reliable watermark or duplicate PKs.
-    Uses TRUNCATE ... CASCADE to handle any foreign key dependencies."""
+    TRUNCATE and all INSERTs are wrapped in a single explicit transaction so
+    a mid-run failure rolls back cleanly instead of leaving the table empty.
+    Used for tables with no reliable watermark or where full refresh is needed."""
     name    = table["mssql_table"]
     schema  = table["pg_schema"]
     tname   = table["pg_table"]
@@ -627,31 +628,43 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     ms_cur.execute(query)
 
     pg_cur = pg_conn.cursor()
-    # CASCADE ensures dependent tables are also truncated, preventing
-    # duplicate key errors when foreign key constraints exist.
-    # Commit immediately so the TRUNCATE cannot be rolled back by a
-    # subsequent INSERT failure, which would leave stale data in place.
-    pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}" CASCADE')
-    pg_conn.commit()
 
-    col_list   = ", ".join(f'"{c}"' for c in pg_cols)
-    upsert_sql = (
-        f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
-        f'VALUES ({", ".join(["%s"] * len(pg_cols))})'
-    )
+    try:
+        # Roll back any aborted transaction state from a prior failed run
+        # before starting fresh — prevents "current transaction is aborted" errors
+        pg_conn.rollback()
 
-    total = 0
-    while True:
-        rows = ms_cur.fetchmany(CHUNK_SIZE)
-        if not rows:
-            break
-        rows = [normalize_row(r, col_map) for r in rows]
-        data = [tuple(row[c] for c in pg_cols) for row in rows]
-        psycopg2.extras.execute_batch(pg_cur, upsert_sql, data, page_size=CHUNK_SIZE)
-        total += len(rows)
-        log.info(f"[{name}] ... {total} rows loaded")
+        # Explicit BEGIN so TRUNCATE + all INSERTs are a single atomic unit.
+        # If anything fails below, the rollback in the except block restores
+        # the table to its pre-truncate state.
+        pg_cur.execute("BEGIN")
+        pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}" RESTART IDENTITY CASCADE')
 
-    pg_conn.commit()
+        col_list   = ", ".join(f'"{c}"' for c in pg_cols)
+        insert_sql = (
+            f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
+            f'VALUES ({", ".join(["%s"] * len(pg_cols))})'
+        )
+
+        total = 0
+        while True:
+            rows = ms_cur.fetchmany(CHUNK_SIZE)
+            if not rows:
+                break
+            rows = [normalize_row(r, col_map) for r in rows]
+            data = [tuple(row[c] for c in pg_cols) for row in rows]
+            psycopg2.extras.execute_batch(pg_cur, insert_sql, data, page_size=CHUNK_SIZE)
+            total += len(rows)
+            log.info(f"[{name}] ... {total} rows loaded")
+
+        pg_conn.commit()
+
+    except Exception as e:
+        pg_conn.rollback()
+        ms_cur.close()
+        pg_cur.close()
+        raise RuntimeError(f"[{name}] Full replace failed and was rolled back: {e}") from e
+
     ms_cur.close()
     pg_cur.close()
     log.info(f"[{name}] Full replace done. {total} rows.")
