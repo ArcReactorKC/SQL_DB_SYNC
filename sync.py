@@ -138,6 +138,8 @@ def load_tables_config() -> list[dict]:
             t["sync_mode"] = "incremental"
         if "col_map" not in t:
             t["col_map"] = {}
+        if "dedup_col" not in t:
+            t["dedup_col"] = None
 
     return tables
 
@@ -216,6 +218,7 @@ def discover_sqlt_tables(ms_conn) -> list[dict]:
             "lookback_ms":    60_000,
             "sync_mode":      "incremental",
             "col_map":        {},
+            "dedup_col":      None,
         })
         log.info(f"[discovery] Found sqlt table: {schema}.{tname}")
 
@@ -343,8 +346,9 @@ def ensure_static_pg_table(table: dict, ms_conn, pg_conn):
         for pg_col, pg_type in col_defs:
             col_sql_parts.append(f'    "{pg_col}" {pg_type}')
 
-        pk_constraint = ", ".join(f'"{c}"' for c in pk_cols)
-        col_sql_parts.append(f"    PRIMARY KEY ({pk_constraint})")
+        if pk_cols:
+            pk_constraint = ", ".join(f'"{c}"' for c in pk_cols)
+            col_sql_parts.append(f"    PRIMARY KEY ({pk_constraint})")
 
         create_sql = (
             f'CREATE TABLE IF NOT EXISTS "{schema}"."{pg_table}" (\n'
@@ -612,17 +616,39 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     """Truncate the PG table and reload all rows from MSSQL.
     TRUNCATE and all INSERTs are wrapped in a single explicit transaction so
     a mid-run failure rolls back cleanly instead of leaving the table empty.
-    Used for tables with no reliable watermark or where full refresh is needed."""
-    name    = table["mssql_table"]
-    schema  = table["pg_schema"]
-    tname   = table["pg_table"]
-    col_map = table.get("col_map", {})
+
+    If 'dedup_col' is set in the table config, the MSSQL query uses ROW_NUMBER()
+    to keep only the first occurrence of each dedup_col value. This handles dirty
+    source tables that have no PK enforcement and contain duplicate rows.
+    """
+    name      = table["mssql_table"]
+    schema    = table["pg_schema"]
+    tname     = table["pg_table"]
+    col_map   = table.get("col_map", {})
+    dedup_col = table.get("dedup_col")  # optional: deduplicate source on this column
 
     mssql_cols, pg_cols = resolve_columns(table)
-    cols  = ", ".join(f"[{c}]" for c in mssql_cols)
-    query = f"SELECT {cols} FROM [{name}]"
+    cols_str = ", ".join(f"[{c}]" for c in mssql_cols)
 
-    log.info(f"[{name}] Full replace mode — truncating {schema}.{tname} ...")
+    if dedup_col:
+        # ROW_NUMBER() PARTITION BY dedup_col keeps exactly one row per unique
+        # value, discarding duplicates that would violate PG constraints.
+        query = f"""
+            SELECT {cols_str}
+            FROM (
+                SELECT {cols_str},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY [{dedup_col}]
+                           ORDER BY [{dedup_col}]
+                       ) AS _rn
+                FROM [{name}]
+            ) AS _deduped
+            WHERE _rn = 1
+        """
+        log.info(f"[{name}] Full replace mode with dedup on [{dedup_col}]")
+    else:
+        query = f"SELECT {cols_str} FROM [{name}]"
+        log.info(f"[{name}] Full replace mode — truncating {schema}.{tname} ...")
 
     ms_cur = ms_conn.cursor()
     ms_cur.execute(query)
