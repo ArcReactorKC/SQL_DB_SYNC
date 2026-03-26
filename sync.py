@@ -611,11 +611,14 @@ def sync_table_incremental(table: dict, watermarks: dict, ms_conn, pg_conn) -> i
 def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     """Truncate the PG table and reload all rows from MSSQL.
     Used for tables with no reliable watermark or duplicate PKs.
-    Uses TRUNCATE ... CASCADE to handle any foreign key dependencies."""
+    Uses TRUNCATE ... CASCADE to handle any foreign key dependencies.
+    Uses INSERT ... ON CONFLICT DO NOTHING to gracefully handle duplicate
+    PKs in the source data without failing the entire sync."""
     name    = table["mssql_table"]
     schema  = table["pg_schema"]
     tname   = table["pg_table"]
     col_map = table.get("col_map", {})
+    pk_cols = table.get("pk_cols", [])
 
     mssql_cols, pg_cols = resolve_columns(table)
     cols  = ", ".join(f"[{c}]" for c in mssql_cols)
@@ -634,10 +637,12 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}" CASCADE')
     pg_conn.commit()
 
-    col_list   = ", ".join(f'"{c}"' for c in pg_cols)
+    col_list      = ", ".join(f'"{c}"' for c in pg_cols)
+    conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
     upsert_sql = (
         f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
-        f'VALUES ({", ".join(["%s"] * len(pg_cols))})'
+        f'VALUES ({", ".join(["%s"] * len(pg_cols))}) '
+        f'ON CONFLICT ({conflict_cols}) DO NOTHING'
     )
 
     total = 0
