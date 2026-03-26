@@ -637,13 +637,20 @@ def sync_table_full_replace(table: dict, ms_conn, pg_conn) -> int:
     pg_cur.execute(f'TRUNCATE TABLE "{schema}"."{tname}" CASCADE')
     pg_conn.commit()
 
-    col_list      = ", ".join(f'"{c}"' for c in pg_cols)
-    conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
-    upsert_sql = (
-        f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
-        f'VALUES ({", ".join(["%s"] * len(pg_cols))}) '
-        f'ON CONFLICT ({conflict_cols}) DO NOTHING'
-    )
+    col_list = ", ".join(f'"{c}"' for c in pg_cols)
+    if pk_cols:
+        conflict_cols = ", ".join(f'"{c}"' for c in pk_cols)
+        upsert_sql = (
+            f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
+            f'VALUES ({", ".join(["%s"] * len(pg_cols))}) '
+            f'ON CONFLICT ({conflict_cols}) DO NOTHING'
+        )
+    else:
+        # No PK defined — plain INSERT (TRUNCATE already cleared the table)
+        upsert_sql = (
+            f'INSERT INTO "{schema}"."{tname}" ({col_list}) '
+            f'VALUES ({", ".join(["%s"] * len(pg_cols))})'
+        )
 
     total = 0
     while True:
